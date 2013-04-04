@@ -3,14 +3,25 @@
  */
 
 #include "ngx_http_pubsub.h"
+#include "ngx_http_pubsub_core.h"
+#include "ngx_http_pubsub_queue.h"
 
-static char * ngx_http_pubsub(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
-static void * ngx_http_pubsub_create_loc_conf(ngx_conf_t *cf);
-static char * ngx_http_pubsub_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
-static ngx_int_t ngx_http_pubsub_handler(ngx_http_request_t *r);
-static void ngx_http_pubsub_body_handler(ngx_http_request_t *r);
+/* private vars */
 
-/* DIRECTIVES */
+static ngx_str_t                    shm_zone_name = ngx_string("ngx_http_pubsub");
+static ngx_shm_zone_t              *shm_zone = NULL;
+
+/* functions declr */
+
+static char        *ngx_http_pubsub(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static void        *ngx_http_pubsub_create_loc_conf(ngx_conf_t *cf);
+static char        *ngx_http_pubsub_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
+static ngx_int_t    ngx_http_pubsub_handler(ngx_http_request_t *r);
+static ngx_int_t    ngx_http_pubsub_postconfiguration(ngx_conf_t *cf);
+static ngx_int_t    ngx_http_pubsub_init_process(ngx_cycle_t *cycle);
+static ngx_int_t    ngx_http_pubsub_shm_zone_init(ngx_shm_zone_t *shm_zone, void *data);
+
+/* module directives */
 
 static ngx_command_t ngx_http_pubsub_commands[] = {
 
@@ -25,12 +36,12 @@ static ngx_command_t ngx_http_pubsub_commands[] = {
 
 };
 
-/* HTTP MODULE CONTEXT */
+/* http module context */
 
 static ngx_http_module_t module_ctx = {
 
     NULL,                                   /* preconfiguration */
-    NULL,                                   /* postconfiguration */
+    ngx_http_pubsub_postconfiguration,      /* postconfiguration */
 
     NULL,                                   /* create main configuration */
     NULL,                                   /* init main configuration */
@@ -43,8 +54,7 @@ static ngx_http_module_t module_ctx = {
 
 };
 
-
-/* MODULE DEFINITION */
+/* module definition */
 
 ngx_module_t ngx_http_pubsub_module = {
 
@@ -54,7 +64,7 @@ ngx_module_t ngx_http_pubsub_module = {
     NGX_HTTP_MODULE,                    /* module type */
     NULL,                               /* init master */
     NULL,                               /* init module */
-    NULL,                               /* init process */
+    ngx_http_pubsub_init_process,       /* init process */
     NULL,                               /* init thread */
     NULL,                               /* exit thread */
     NULL,                               /* exit process */
@@ -63,11 +73,40 @@ ngx_module_t ngx_http_pubsub_module = {
 
 };
 
+/* initialization after all http module configuration parsed */
+
+static ngx_int_t
+ngx_http_pubsub_postconfiguration(ngx_conf_t *cf) {
+
+    size_t size = 1 << 16;
+
+    if (shm_zone == NULL) {
+        shm_zone = ngx_shared_memory_add(cf, &shm_zone_name, size, &ngx_http_pubsub_module);
+        shm_zone->init = ngx_http_pubsub_shm_zone_init;
+    }
+
+    return NGX_OK;
+
+}
+
+/* module initialization after all configuration parsed
+   cycle->log updated and shm_zone created*/
+
+static ngx_int_t
+ngx_http_pubsub_init_process(ngx_cycle_t *cycle) {
+
+    return ngx_http_pubsub_core_init(cycle, shm_zone);
+
+}
+
+/* "pubsub" directive handler */
+
 static char *
 ngx_http_pubsub(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
 
     ngx_http_core_loc_conf_t    *clcf;
     
+    /* install handler */
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
     clcf->handler = ngx_http_pubsub_handler;
 
@@ -75,27 +114,7 @@ ngx_http_pubsub(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
 
 }
 
-static void *
-ngx_http_pubsub_create_loc_conf(ngx_conf_t *cf) {
-
-    ngx_http_pubsub_loc_conf_t *lcf;
-
-    lcf = ngx_palloc(cf->pool, sizeof(ngx_http_pubsub_loc_conf_t));
-    if (lcf == NULL) {
-        return NGX_CONF_ERROR;
-    }
-    ngx_memzero(lcf, sizeof(ngx_http_pubsub_loc_conf_t));
-    
-    return lcf;
-
-}
-
-static char *
-ngx_http_pubsub_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child) {
-
-    return NGX_CONF_OK;
-
-}
+/* content phase handler */
 
 static ngx_int_t
 ngx_http_pubsub_handler(ngx_http_request_t *r) {
@@ -122,23 +141,17 @@ ngx_http_pubsub_handler(ngx_http_request_t *r) {
         lcf->latest_subscriber = r;
         /* increase reference count */
         r->main->count++;
-        return NGX_OK;
+        return NGX_DONE;
     }
     
     if (r->method == NGX_HTTP_POST) {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
             "ngx_http_pubsub publisher");
-        r->request_body_in_single_buf = 1;
-        r->request_body_in_persistent_file = 1;
-        r->request_body_in_clean_file = 0;
-        r->request_body_file_log_level = 0;
-
-        rc = ngx_http_read_client_request_body(r, ngx_http_pubsub_body_handler);
-        r->keepalive = 0;
+        /*rc = ngx_http_pubsub_publish(r);*/
         if (rc >= NGX_HTTP_SPECIAL_RESPONSE)
             return rc;
         else
-            return NGX_OK;
+            return NGX_DONE;
 
     }
 
@@ -146,24 +159,40 @@ ngx_http_pubsub_handler(ngx_http_request_t *r) {
 
 }
 
-static void
-ngx_http_pubsub_body_handler(ngx_http_request_t *r) {
+/* shared memory initializer */
 
-    ngx_http_pubsub_loc_conf_t      *lcf;
-    ngx_buf_t                       *b;
-    ngx_chain_t                     out;
+static ngx_int_t
+ngx_http_pubsub_shm_zone_init(ngx_shm_zone_t *shm_zone, void *data) {
 
-    lcf = ngx_http_get_module_loc_conf(r, ngx_http_pubsub_module);
-
-    if (r->request_body->bufs->buf != NULL) {
-        b = ngx_create_temp_buf(lcf->latest_subscriber->pool, 0);
-        *b = *(r->request_body->bufs->buf);
-        b->last_buf = 0;
-        b->flush = 1;
-        out.buf = b;
-        out.next = NULL;
-        ngx_http_finalize_request(r, ngx_http_output_filter(lcf->latest_subscriber, &out));
-    }
+    ngx_http_pubsub_queue_init(shm_zone);
+    
+    return NGX_OK;
 
 }
+
+/* to create loc_conf */
+
+static void *
+ngx_http_pubsub_create_loc_conf(ngx_conf_t *cf) {
+
+    ngx_http_pubsub_loc_conf_t *lcf;
+
+    lcf = ngx_pcalloc(cf->pool, sizeof(ngx_http_pubsub_loc_conf_t));
+    if (lcf == NULL) {
+        return NGX_CONF_ERROR;
+    }
+    
+    return lcf;
+
+}
+
+/* to merge loc_conf */
+
+static char *
+ngx_http_pubsub_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child) {
+
+    return NGX_CONF_OK;
+
+}
+
 
